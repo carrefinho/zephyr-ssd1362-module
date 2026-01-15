@@ -94,3 +94,9 @@ properties:
     description: |
       Initial contrast setting (0-255). Higher values increase brightness
       but also increase current draw. The default (0x9F) matches u8g2.
+
+  inversion-on:
+    type: boolean
+    description: |
+      Invert display colors. When enabled, pixels that would normally be
+      white are displayed as black and vice versa.

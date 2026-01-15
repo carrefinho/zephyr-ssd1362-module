@@ -65,15 +65,14 @@ struct ssd1362_config {
 	bool remap_com_dual;
 	uint8_t segments_per_pixel;
 	uint8_t contrast;
+	bool inversion_on;
 	uint8_t *conversion_buf;
 	size_t conversion_buf_size;
 };
 
 /*
- * SSD1362 requires command parameters to be sent with D/C=LOW (command mode),
+ * SSD1362 requires both commands AND parameters to be sent with D/C=LOW,
  * unlike typical MIPI DBI displays where parameters use D/C=HIGH.
- * The datasheet command table shows D/C#=0 for both command bytes AND parameters.
- * This matches u8g2's u8x8_cad_110 which sends both cmd and arg with DC=0.
  */
 static inline int ssd1362_write_command(const struct device *dev, uint8_t cmd, const uint8_t *buf,
 					size_t len)
@@ -81,13 +80,11 @@ static inline int ssd1362_write_command(const struct device *dev, uint8_t cmd, c
 	const struct ssd1362_config *config = dev->config;
 	int ret;
 
-	/* Send command byte with DC=LOW */
 	ret = mipi_dbi_command_write(config->mipi_dev, &config->dbi_config, cmd, NULL, 0);
 	if (ret < 0) {
 		return ret;
 	}
 
-	/* Send each parameter byte as a "command" (DC=LOW) */
 	for (size_t i = 0; i < len; i++) {
 		ret = mipi_dbi_command_write(config->mipi_dev, &config->dbi_config, buf[i], NULL, 0);
 		if (ret < 0) {
@@ -100,63 +97,49 @@ static inline int ssd1362_write_command(const struct device *dev, uint8_t cmd, c
 
 static int ssd1362_blanking_on(const struct device *dev)
 {
-	/* All pixels OFF (blank display) */
 	return ssd1362_write_command(dev, SSD1362_MODE_ALL_OFF, NULL, 0);
 }
 
 static int ssd1362_blanking_off(const struct device *dev)
 {
-	/* Normal display mode (show RAM content) */
-	return ssd1362_write_command(dev, SSD1362_MODE_NORMAL, NULL, 0);
+	const struct ssd1362_config *config = dev->config;
+	uint8_t mode = config->inversion_on ? SSD1362_MODE_INVERSE : SSD1362_MODE_NORMAL;
+
+	return ssd1362_write_command(dev, mode, NULL, 0);
 }
 
-/*
- * The controller uses 4-bit grayscale format, so one pixel is represented by 4 bits.
- * Zephyr's display API does not support this format, so this uses mono01, and converts each 1-bit
- * pixel to 1111 or 0000.
- *
- * buf_in: pointer to input buffer in mono01 format. This value will bel updated to point to
- * the first byte after the last converted pixel.
- * pixel_count: pointer to the total number of pixels in buf_in to convert. The number of
- *   converted pixels will be subtracted.
- * returns the number of bytes written to buf_out.
- */
+/* Convert MONO01 (1 byte = 8 pixels) to 4-bit grayscale (1 byte = 2 pixels) */
 static int ssd1362_conv_mono01_grayscale(const uint8_t **buf_in, uint32_t *pixel_count,
 					 uint8_t *buf_out, size_t buf_out_size,
 					 uint8_t segments_per_pixel)
 {
-	/* Output buffer size gets rounded down to avoid splitting chunks in the middle of input
-	 * bytes
-	 */
-	uint16_t pixels_in_chunk =
-		MIN(*pixel_count,
-		    ROUND_DOWN((buf_out_size * SEGMENTS_PER_BYTE) / segments_per_pixel, 8));
+	size_t out_idx = 0;
+	size_t in_idx = 0;
+	size_t max_input_bytes = *pixel_count / 8;
 
-	/*
-	 * SSD1362 expects: first pixel in HIGH nibble, second pixel in LOW nibble
-	 * (matching u8g2's u8x8_ssd1362_8to32 function)
-	 *
-	 * MONO01 format: MSB is leftmost pixel, so we read bit 7 first, then 6, etc.
-	 */
-	for (uint16_t in_idx = 0; in_idx < pixels_in_chunk; in_idx++) {
-		uint8_t color = ((*buf_in)[in_idx / 8] & BIT(7 - (in_idx % 8))) ? 0xF : 0;
+	while (in_idx < max_input_bytes && (out_idx + 4 * segments_per_pixel) <= buf_out_size) {
+		uint8_t b = (*buf_in)[in_idx];
 
-		for (size_t i = 0; i < segments_per_pixel; i++) {
-			size_t seg_idx = in_idx * segments_per_pixel + i;
-			/* Invert nibble position: even pixels → high nibble, odd → low */
-			size_t shift = BITS_PER_SEGMENT * (1 - (seg_idx % SEGMENTS_PER_BYTE));
-
-			if (seg_idx % SEGMENTS_PER_BYTE == 0) {
-				buf_out[seg_idx / SEGMENTS_PER_BYTE] = color << shift;
-			} else {
-				buf_out[seg_idx / SEGMENTS_PER_BYTE] |= color << shift;
-			}
+		/* LSB-first: bit 0 = leftmost pixel. Left pixel maps to high nibble. */
+		for (size_t s = 0; s < segments_per_pixel; s++) {
+			buf_out[out_idx++] = ((b & BIT(0)) ? 0xF0 : 0) | ((b & BIT(1)) ? 0x0F : 0);
 		}
+		for (size_t s = 0; s < segments_per_pixel; s++) {
+			buf_out[out_idx++] = ((b & BIT(2)) ? 0xF0 : 0) | ((b & BIT(3)) ? 0x0F : 0);
+		}
+		for (size_t s = 0; s < segments_per_pixel; s++) {
+			buf_out[out_idx++] = ((b & BIT(4)) ? 0xF0 : 0) | ((b & BIT(5)) ? 0x0F : 0);
+		}
+		for (size_t s = 0; s < segments_per_pixel; s++) {
+			buf_out[out_idx++] = ((b & BIT(6)) ? 0xF0 : 0) | ((b & BIT(7)) ? 0x0F : 0);
+		}
+
+		in_idx++;
 	}
 
-	*buf_in += pixels_in_chunk / 8;
-	*pixel_count -= pixels_in_chunk;
-	return pixels_in_chunk * segments_per_pixel / SEGMENTS_PER_BYTE;
+	*buf_in += in_idx;
+	*pixel_count -= in_idx * 8;
+	return out_idx;
 }
 
 static int ssd1362_write_pixels(const struct device *dev, const uint8_t *buf, uint32_t pixel_count)
@@ -168,16 +151,16 @@ static int ssd1362_write_pixels(const struct device *dev, const uint8_t *buf, ui
 		size_t len;
 		int ret;
 
-		/* Other formats, such as RGB888 to grayscale could be added by switching here */
 		len = ssd1362_conv_mono01_grayscale(&buf, &pixel_count, config->conversion_buf,
 						    config->conversion_buf_size,
 						    config->segments_per_pixel);
 
-		/* As the MIPI DBI interface also does not support 4bit grayscale, it is disguised
-		 * as a single row of mono01 pixels. While this could theoretically cause issues
-		 * with some mipi-dbi implementations, the SPI-based driver ignores this metadata,
-		 * and is likely the most relevant in practice.
-		 */
+		if (len == 0) {
+			LOG_ERR("Conversion returned 0 bytes, %u pixels remaining", pixel_count);
+			break;
+		}
+
+		/* Send raw bytes via MIPI DBI (metadata is ignored by SPI driver) */
 		mipi_desc.buf_size = len;
 		mipi_desc.width = len * 8;
 		mipi_desc.height = 1;
@@ -189,6 +172,7 @@ static int ssd1362_write_pixels(const struct device *dev, const uint8_t *buf, ui
 			return ret;
 		}
 	}
+
 	return 0;
 }
 
@@ -199,7 +183,7 @@ static int ssd1362_write(const struct device *dev, const uint16_t x, const uint1
 	size_t buf_len;
 	int ret;
 	uint8_t cmd_data[2];
-	int32_t pixel_count = desc->width * desc->height;
+	uint32_t pixel_count = desc->width * desc->height;
 
 	if (desc->pitch < desc->width) {
 		LOG_ERR("Pitch is smaller than width");
@@ -217,14 +201,14 @@ static int ssd1362_write(const struct device *dev, const uint16_t x, const uint1
 		return -EINVAL;
 	}
 
-	LOG_DBG("x %u, y %u, pitch %u, width %u, height %u, buf_len %u", x, y, desc->pitch,
-		desc->width, desc->height, buf_len);
+	cmd_data[0] = y;
+	cmd_data[1] = y + desc->height - 1;
+	ret = ssd1362_write_command(dev, SSD1362_SET_ROW_ADDR, cmd_data, 2);
+	if (ret < 0) {
+		return ret;
+	}
 
-	/*
-	 * SSD1362 column addressing: each column address maps to 2 pixels
-	 * (4-bit grayscale = 2 pixels per byte). Column addresses range 0-127.
-	 * For segments_per_pixel > 1, multiple segments are mapped to one pixel.
-	 */
+	/* Column address maps to 2 pixels (4-bit grayscale) */
 	cmd_data[0] = config->column_offset + (x >> 1) * config->segments_per_pixel;
 	cmd_data[1] =
 		config->column_offset + ((x + desc->width) >> 1) * config->segments_per_pixel - 1;
@@ -233,14 +217,6 @@ static int ssd1362_write(const struct device *dev, const uint16_t x, const uint1
 		return ret;
 	}
 
-	cmd_data[0] = y;
-	cmd_data[1] = y + desc->height - 1;
-	ret = ssd1362_write_command(dev, SSD1362_SET_ROW_ADDR, cmd_data, 2);
-	if (ret < 0) {
-		return ret;
-	}
-
-	/* SSD1362 doesn't need an explicit RAM write enable command like SSD1322 */
 	return ssd1362_write_pixels(dev, buf, pixel_count);
 }
 
@@ -258,6 +234,7 @@ static void ssd1362_get_capabilities(const struct device *dev, struct display_ca
 	caps->y_resolution = config->height;
 	caps->supported_pixel_formats = PIXEL_FORMAT_MONO01;
 	caps->current_pixel_format = PIXEL_FORMAT_MONO01;
+	caps->screen_info = 0;
 }
 
 static int ssd1362_init_device(const struct device *dev)
@@ -266,162 +243,122 @@ static int ssd1362_init_device(const struct device *dev)
 	uint8_t data[2];
 	const struct ssd1362_config *config = dev->config;
 
-	LOG_INF("SSD1362 init starting...");
-
-	/* Hardware reset */
 	ret = mipi_dbi_reset(config->mipi_dev, 1);
 	if (ret < 0) {
 		LOG_ERR("Reset failed: %d", ret);
 		return ret;
 	}
-	k_usleep(100);  /* Match SSD1322 timing */
+	k_usleep(100);
 
-	/* Unlock command interface (from u8g2) */
 	data[0] = 0x12;
 	ret = ssd1362_write_command(dev, SSD1362_COMMAND_LOCK, data, 1);
 	if (ret < 0) {
 		return ret;
 	}
 
-	/* Display OFF */
 	ret = ssd1362_write_command(dev, SSD1362_DISPLAY_OFF, NULL, 0);
 	if (ret < 0) {
-		LOG_ERR("Display OFF failed: %d", ret);
 		return ret;
 	}
 
-	/* Disable fade mode (from u8g2) */
 	data[0] = 0x00;
 	ret = ssd1362_write_command(dev, SSD1362_SET_FADE_MODE, data, 1);
 	if (ret < 0) {
 		return ret;
 	}
 
-	/* Set MUX ratio */
 	data[0] = config->mux_ratio - 1;
 	ret = ssd1362_write_command(dev, SSD1362_SET_MUX_RATIO, data, 1);
 	if (ret < 0) {
 		return ret;
 	}
 
-	/* Set display start line */
 	data[0] = config->start_line;
 	ret = ssd1362_write_command(dev, SSD1362_SET_START_LINE, data, 1);
 	if (ret < 0) {
 		return ret;
 	}
 
-	/* Set display offset */
 	data[0] = config->row_offset;
 	ret = ssd1362_write_command(dev, SSD1362_SET_DISPLAY_OFFSET, data, 1);
 	if (ret < 0) {
 		return ret;
 	}
 
-	/*
-	 * Set Re-map (SSD1362 uses single byte)
-	 * Bit 0: Column Address Re-map
-	 * Bit 1: Nibble Re-map
-	 * Bit 2: Horizontal/Vertical Address Increment (0=horizontal)
-	 * Bit 4: COM Re-map
-	 * Bit 6: SEG Split Odd Even
-	 * Bit 7: SEG left/right remap
-	 */
-	data[0] = 0x00;
-	WRITE_BIT(data[0], 0, config->remap_columns);
-	WRITE_BIT(data[0], 1, config->remap_nibble);
-	WRITE_BIT(data[0], 2, config->remap_row_first);
-	WRITE_BIT(data[0], 4, config->remap_rows);
-	WRITE_BIT(data[0], 6, config->remap_com_odd_even_split);
-	WRITE_BIT(data[0], 7, config->remap_com_dual);
+	/* Remap: 0xC3 = column remap + nibble remap + SEG split + SEG left/right */
+	data[0] = 0xC3;
 	ret = ssd1362_write_command(dev, SSD1362_SET_REMAP, data, 1);
 	if (ret < 0) {
 		return ret;
 	}
 
-	/* Set contrast */
 	data[0] = config->contrast;
 	ret = ssd1362_write_command(dev, SSD1362_SET_CONTRAST, data, 1);
 	if (ret < 0) {
 		return ret;
 	}
 
-	/* Set default linear greyscale table */
 	ret = ssd1362_write_command(dev, SSD1362_DEFAULT_GREYSCALE, NULL, 0);
 	if (ret < 0) {
 		return ret;
 	}
 
-	/* Set phase length (u8g2: 0x22) */
 	data[0] = 0x22;
 	ret = ssd1362_write_command(dev, SSD1362_SET_PHASE_LENGTH, data, 1);
 	if (ret < 0) {
 		return ret;
 	}
 
-	/* Set display clock divider / oscillator frequency (u8g2: 0xA0) */
 	data[0] = 0xA0;
 	ret = ssd1362_write_command(dev, SSD1362_SET_CLOCK_DIV, data, 1);
 	if (ret < 0) {
 		return ret;
 	}
 
-	/* Set second precharge period (u8g2: 0x04) */
 	data[0] = 0x04;
 	ret = ssd1362_write_command(dev, SSD1362_SET_SECOND_PRECHARGE, data, 1);
 	if (ret < 0) {
 		return ret;
 	}
 
-	/* Set VDD regulator (internal) */
 	data[0] = 0x01;
 	ret = ssd1362_write_command(dev, SSD1362_SET_VDD, data, 1);
 	if (ret < 0) {
 		return ret;
 	}
 
-	/* Set IREF selection: 0x9E = internal IREF (lower current, less heat) */
 	data[0] = 0x9E;
 	ret = ssd1362_write_command(dev, SSD1362_SET_IREF, data, 1);
 	if (ret < 0) {
 		return ret;
 	}
 
-	/* Set pre-charge voltage level (u8g2: 0x1F = 0.51*Vcc) */
 	data[0] = 0x1F;
 	ret = ssd1362_write_command(dev, SSD1362_SET_PRECHARGE_VOLTAGE, data, 1);
 	if (ret < 0) {
 		return ret;
 	}
 
-	/* Set pre-charge voltage capacitor (u8g2: 0x01 = with Vp capacitor) */
 	data[0] = 0x01;
 	ret = ssd1362_write_command(dev, SSD1362_SET_PRECHARGE_CAP, data, 1);
 	if (ret < 0) {
 		return ret;
 	}
 
-	/* Set VCOMH deselect level (u8g2: 0x07 = 0.86*Vcc) */
 	data[0] = 0x07;
 	ret = ssd1362_write_command(dev, SSD1362_SET_VCOMH, data, 1);
 	if (ret < 0) {
 		return ret;
 	}
 
-	/* Normal display mode */
-	ret = ssd1362_write_command(dev, SSD1362_MODE_NORMAL, NULL, 0);
+	ret = ssd1362_write_command(dev,
+				    config->inversion_on ? SSD1362_MODE_INVERSE : SSD1362_MODE_NORMAL,
+				    NULL, 0);
 	if (ret < 0) {
 		return ret;
 	}
 
-	/* Turn display on */
-	ret = ssd1362_write_command(dev, SSD1362_DISPLAY_ON, NULL, 0);
-	if (ret < 0) {
-		return ret;
-	}
-
-	LOG_INF("SSD1362 init complete");
-	return 0;
+	return ssd1362_write_command(dev, SSD1362_DISPLAY_ON, NULL, 0);
 }
 
 static int ssd1362_init(const struct device *dev)
@@ -473,6 +410,7 @@ static DEVICE_API(display, ssd1362_driver_api) = {
 		.remap_com_dual = DT_PROP(node_id, remap_com_dual),                                \
 		.segments_per_pixel = DT_PROP(node_id, segments_per_pixel),                        \
 		.contrast = DT_PROP(node_id, contrast),                                            \
+		.inversion_on = DT_PROP(node_id, inversion_on),                                    \
 		.mipi_dev = DEVICE_DT_GET(DT_PARENT(node_id)),                                     \
 		.dbi_config = {.mode = MIPI_DBI_MODE_SPI_4WIRE,                                    \
 			       .config = MIPI_DBI_SPI_CONFIG_DT(                                   \
