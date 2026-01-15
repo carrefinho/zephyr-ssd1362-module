@@ -1,24 +1,15 @@
-/*
- * Copyright (c) 2024 Lukasz Hawrylko
- *
- * SPDX-License-Identifier: Apache-2.0
- */
-
-#include "zephyr/sys/util.h"
 #define DT_DRV_COMPAT solomon_ssd1362
+
+#include <string.h>
+#include <zephyr/device.h>
+#include <zephyr/drivers/display.h>
+#include <zephyr/drivers/mipi_dbi.h>
+#include <zephyr/kernel.h>
+#include <zephyr/sys/util.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(ssd1362, CONFIG_DISPLAY_LOG_LEVEL);
 
-#include <string.h>
-#include <zephyr/device.h>
-#include <zephyr/init.h>
-#include <zephyr/drivers/display.h>
-#include <zephyr/drivers/gpio.h>
-#include <zephyr/drivers/mipi_dbi.h>
-#include <zephyr/kernel.h>
-
-/* SSD1362 Command Set */
 #define SSD1362_SET_COLUMN_ADDR        0x15
 #define SSD1362_SET_FADE_MODE          0x23
 #define SSD1362_SET_ROW_ADDR           0x75
@@ -45,8 +36,14 @@ LOG_MODULE_REGISTER(ssd1362, CONFIG_DISPLAY_LOG_LEVEL);
 #define SSD1362_SET_MUX_RATIO          0xCA
 #define SSD1362_COMMAND_LOCK           0xFD
 
-#define BITS_PER_SEGMENT  4
-#define SEGMENTS_PER_BYTE (8 / BITS_PER_SEGMENT)
+#define SSD1362_COMMAND_LOCK_UNLOCK    0x12
+
+#define SSD1362_BITS_PER_SEGMENT       4
+#define SSD1362_SEGMENTS_PER_BYTE      (8 / SSD1362_BITS_PER_SEGMENT)
+
+struct ssd1362_data {
+	enum display_pixel_format current_pf;
+};
 
 struct ssd1362_config {
 	const struct device *mipi_dev;
@@ -66,14 +63,11 @@ struct ssd1362_config {
 	uint8_t segments_per_pixel;
 	uint8_t contrast;
 	bool inversion_on;
+	bool iref_external;
 	uint8_t *conversion_buf;
 	size_t conversion_buf_size;
 };
 
-/*
- * SSD1362 requires both commands AND parameters to be sent with D/C=LOW,
- * unlike typical MIPI DBI displays where parameters use D/C=HIGH.
- */
 static inline int ssd1362_write_command(const struct device *dev, uint8_t cmd, const uint8_t *buf,
 					size_t len)
 {
@@ -108,7 +102,6 @@ static int ssd1362_blanking_off(const struct device *dev)
 	return ssd1362_write_command(dev, mode, NULL, 0);
 }
 
-/* Convert MONO01 (1 byte = 8 pixels) to 4-bit grayscale (1 byte = 2 pixels) */
 static int ssd1362_conv_mono01_grayscale(const uint8_t **buf_in, uint32_t *pixel_count,
 					 uint8_t *buf_out, size_t buf_out_size,
 					 uint8_t segments_per_pixel)
@@ -120,7 +113,6 @@ static int ssd1362_conv_mono01_grayscale(const uint8_t **buf_in, uint32_t *pixel
 	while (in_idx < max_input_bytes && (out_idx + 4 * segments_per_pixel) <= buf_out_size) {
 		uint8_t b = (*buf_in)[in_idx];
 
-		/* LSB-first: bit 0 = leftmost pixel. Left pixel maps to high nibble. */
 		for (size_t s = 0; s < segments_per_pixel; s++) {
 			buf_out[out_idx++] = ((b & BIT(0)) ? 0xF0 : 0) | ((b & BIT(1)) ? 0x0F : 0);
 		}
@@ -142,7 +134,49 @@ static int ssd1362_conv_mono01_grayscale(const uint8_t **buf_in, uint32_t *pixel
 	return out_idx;
 }
 
-static int ssd1362_write_pixels(const struct device *dev, const uint8_t *buf, uint32_t pixel_count)
+static int ssd1362_conv_rgb565_grayscale(const uint8_t **buf_in, uint32_t *pixel_count,
+					 uint8_t *buf_out, size_t buf_out_size,
+					 uint8_t segments_per_pixel)
+{
+	const uint16_t *rgb_in = (const uint16_t *)*buf_in;
+	size_t out_idx = 0;
+	size_t in_idx = 0;
+
+	while (in_idx + 1 < *pixel_count && (out_idx + segments_per_pixel) <= buf_out_size) {
+		uint16_t px1_raw = rgb_in[in_idx];
+		uint16_t px2_raw = rgb_in[in_idx + 1];
+#ifdef CONFIG_LV_COLOR_16_SWAP
+		uint16_t px1 = (px1_raw >> 8) | (px1_raw << 8);
+		uint16_t px2 = (px2_raw >> 8) | (px2_raw << 8);
+#else
+		uint16_t px1 = px1_raw;
+		uint16_t px2 = px2_raw;
+#endif
+
+		uint8_t r1 = (px1 >> 11) & 0x1F;
+		uint8_t g1 = (px1 >> 5) & 0x3F;
+		uint8_t b1 = px1 & 0x1F;
+		uint8_t y1 = (r1 * 3 + g1 * 6 + b1) >> 5;
+
+		uint8_t r2 = (px2 >> 11) & 0x1F;
+		uint8_t g2 = (px2 >> 5) & 0x3F;
+		uint8_t b2 = px2 & 0x1F;
+		uint8_t y2 = (r2 * 3 + g2 * 6 + b2) >> 5;
+
+		for (size_t s = 0; s < segments_per_pixel; s++) {
+			buf_out[out_idx++] = (y1 << 4) | y2;
+		}
+
+		in_idx += 2;
+	}
+
+	*buf_in += in_idx * 2;
+	*pixel_count -= in_idx;
+	return out_idx;
+}
+
+static int ssd1362_write_pixels(const struct device *dev, const uint8_t *buf,
+				uint32_t pixel_count, enum display_pixel_format pf)
 {
 	const struct ssd1362_config *config = dev->config;
 	struct display_buffer_descriptor mipi_desc;
@@ -151,16 +185,22 @@ static int ssd1362_write_pixels(const struct device *dev, const uint8_t *buf, ui
 		size_t len;
 		int ret;
 
-		len = ssd1362_conv_mono01_grayscale(&buf, &pixel_count, config->conversion_buf,
-						    config->conversion_buf_size,
-						    config->segments_per_pixel);
+		if (pf == PIXEL_FORMAT_RGB_565) {
+			len = ssd1362_conv_rgb565_grayscale(&buf, &pixel_count,
+							   config->conversion_buf,
+							   config->conversion_buf_size,
+							   config->segments_per_pixel);
+		} else {
+			len = ssd1362_conv_mono01_grayscale(&buf, &pixel_count,
+							   config->conversion_buf,
+							   config->conversion_buf_size,
+							   config->segments_per_pixel);
+		}
 
 		if (len == 0) {
-			LOG_ERR("Conversion returned 0 bytes, %u pixels remaining", pixel_count);
 			break;
 		}
 
-		/* Send raw bytes via MIPI DBI (metadata is ignored by SPI driver) */
 		mipi_desc.buf_size = len;
 		mipi_desc.width = len * 8;
 		mipi_desc.height = 1;
@@ -176,29 +216,126 @@ static int ssd1362_write_pixels(const struct device *dev, const uint8_t *buf, ui
 	return 0;
 }
 
+static size_t ssd1362_conv_row_rgb565(const uint16_t *rgb_in, uint16_t width,
+				      uint8_t *buf_out, uint8_t x_start_odd)
+{
+	size_t out_idx = 0;
+	size_t in_idx = 0;
+
+	if (x_start_odd && width > 0) {
+		uint16_t px = rgb_in[in_idx++];
+#ifdef CONFIG_LV_COLOR_16_SWAP
+		px = (px >> 8) | (px << 8);
+#endif
+		uint8_t r = (px >> 11) & 0x1F;
+		uint8_t g = (px >> 5) & 0x3F;
+		uint8_t b = px & 0x1F;
+		uint8_t y = (r * 3 + g * 6 + b) >> 5;
+
+		buf_out[out_idx++] = y;
+		width--;
+	}
+
+	while (width >= 2) {
+		uint16_t px1 = rgb_in[in_idx++];
+		uint16_t px2 = rgb_in[in_idx++];
+#ifdef CONFIG_LV_COLOR_16_SWAP
+		px1 = (px1 >> 8) | (px1 << 8);
+		px2 = (px2 >> 8) | (px2 << 8);
+#endif
+		uint8_t r1 = (px1 >> 11) & 0x1F;
+		uint8_t g1 = (px1 >> 5) & 0x3F;
+		uint8_t b1 = px1 & 0x1F;
+		uint8_t y1 = (r1 * 3 + g1 * 6 + b1) >> 5;
+
+		uint8_t r2 = (px2 >> 11) & 0x1F;
+		uint8_t g2 = (px2 >> 5) & 0x3F;
+		uint8_t b2 = px2 & 0x1F;
+		uint8_t y2 = (r2 * 3 + g2 * 6 + b2) >> 5;
+
+		buf_out[out_idx++] = (y1 << 4) | y2;
+		width -= 2;
+	}
+
+	if (width == 1) {
+		uint16_t px = rgb_in[in_idx];
+#ifdef CONFIG_LV_COLOR_16_SWAP
+		px = (px >> 8) | (px << 8);
+#endif
+		uint8_t r = (px >> 11) & 0x1F;
+		uint8_t g = (px >> 5) & 0x3F;
+		uint8_t b = px & 0x1F;
+		uint8_t y = (r * 3 + g * 6 + b) >> 5;
+
+		buf_out[out_idx++] = (y << 4);
+	}
+
+	return out_idx;
+}
+
 static int ssd1362_write(const struct device *dev, const uint16_t x, const uint16_t y,
 			 const struct display_buffer_descriptor *desc, const void *buf)
 {
 	const struct ssd1362_config *config = dev->config;
-	size_t buf_len;
+	struct ssd1362_data *data = dev->data;
 	int ret;
 	uint8_t cmd_data[2];
-	uint32_t pixel_count = desc->width * desc->height;
+	enum display_pixel_format pf;
 
 	if (desc->pitch < desc->width) {
 		LOG_ERR("Pitch is smaller than width");
 		return -EINVAL;
 	}
 
-	buf_len = MIN(desc->buf_size, desc->height * desc->width / 8);
-	if (buf == NULL || buf_len == 0U) {
+	if (buf == NULL || desc->buf_size == 0U) {
 		LOG_ERR("Display buffer is not available");
 		return -EINVAL;
 	}
 
-	if (desc->pitch > desc->width) {
-		LOG_ERR("Unsupported mode");
-		return -EINVAL;
+	pf = (data != NULL) ? data->current_pf : PIXEL_FORMAT_RGB_565;
+
+	if (pf == PIXEL_FORMAT_RGB_565) {
+		const uint16_t *rgb_buf = (const uint16_t *)buf;
+		uint16_t x_aligned = x & ~1;
+		uint16_t x_end = x + desc->width;
+		uint16_t x_end_aligned = (x_end + 1) & ~1;
+		uint8_t x_start_odd = x & 1;
+
+		cmd_data[0] = y;
+		cmd_data[1] = y + desc->height - 1;
+		ret = ssd1362_write_command(dev, SSD1362_SET_ROW_ADDR, cmd_data, 2);
+		if (ret < 0) {
+			return ret;
+		}
+
+		cmd_data[0] = config->column_offset + (x_aligned >> 1);
+		cmd_data[1] = config->column_offset + (x_end_aligned >> 1) - 1;
+		ret = ssd1362_write_command(dev, SSD1362_SET_COLUMN_ADDR, cmd_data, 2);
+		if (ret < 0) {
+			return ret;
+		}
+
+		for (uint16_t row = 0; row < desc->height; row++) {
+			size_t len = ssd1362_conv_row_rgb565(
+				&rgb_buf[row * desc->pitch],
+				desc->width,
+				config->conversion_buf,
+				x_start_odd);
+
+			struct display_buffer_descriptor mipi_desc = {
+				.buf_size = len,
+				.width = len * 8,
+				.height = 1,
+				.pitch = len * 8,
+			};
+			ret = mipi_dbi_write_display(config->mipi_dev, &config->dbi_config,
+						     config->conversion_buf, &mipi_desc,
+						     PIXEL_FORMAT_MONO01);
+			if (ret < 0) {
+				return ret;
+			}
+		}
+		return 0;
 	}
 
 	cmd_data[0] = y;
@@ -208,16 +345,15 @@ static int ssd1362_write(const struct device *dev, const uint16_t x, const uint1
 		return ret;
 	}
 
-	/* Column address maps to 2 pixels (4-bit grayscale) */
 	cmd_data[0] = config->column_offset + (x >> 1) * config->segments_per_pixel;
-	cmd_data[1] =
-		config->column_offset + ((x + desc->width) >> 1) * config->segments_per_pixel - 1;
+	cmd_data[1] = config->column_offset + ((x + desc->width) >> 1) * config->segments_per_pixel - 1;
 	ret = ssd1362_write_command(dev, SSD1362_SET_COLUMN_ADDR, cmd_data, 2);
 	if (ret < 0) {
 		return ret;
 	}
 
-	return ssd1362_write_pixels(dev, buf, pixel_count);
+	uint32_t pixel_count = desc->width * desc->height;
+	return ssd1362_write_pixels(dev, buf, pixel_count, pf);
 }
 
 static int ssd1362_set_contrast(const struct device *dev, const uint8_t contrast)
@@ -228,13 +364,30 @@ static int ssd1362_set_contrast(const struct device *dev, const uint8_t contrast
 static void ssd1362_get_capabilities(const struct device *dev, struct display_capabilities *caps)
 {
 	const struct ssd1362_config *config = dev->config;
+	struct ssd1362_data *data = dev->data;
 
 	memset(caps, 0, sizeof(struct display_capabilities));
 	caps->x_resolution = config->width;
 	caps->y_resolution = config->height;
-	caps->supported_pixel_formats = PIXEL_FORMAT_MONO01;
-	caps->current_pixel_format = PIXEL_FORMAT_MONO01;
+	caps->supported_pixel_formats = PIXEL_FORMAT_MONO01 | PIXEL_FORMAT_RGB_565;
+	caps->current_pixel_format = (data != NULL) ? data->current_pf : PIXEL_FORMAT_RGB_565;
 	caps->screen_info = 0;
+}
+
+static int ssd1362_set_pixel_format(const struct device *dev, enum display_pixel_format pf)
+{
+	struct ssd1362_data *data = dev->data;
+
+	if (data == NULL) {
+		return -ENODEV;
+	}
+
+	if (pf == PIXEL_FORMAT_MONO01 || pf == PIXEL_FORMAT_RGB_565) {
+		data->current_pf = pf;
+		return 0;
+	}
+
+	return -ENOTSUP;
 }
 
 static int ssd1362_init_device(const struct device *dev)
@@ -250,7 +403,7 @@ static int ssd1362_init_device(const struct device *dev)
 	}
 	k_usleep(100);
 
-	data[0] = 0x12;
+	data[0] = SSD1362_COMMAND_LOCK_UNLOCK;
 	ret = ssd1362_write_command(dev, SSD1362_COMMAND_LOCK, data, 1);
 	if (ret < 0) {
 		return ret;
@@ -285,7 +438,6 @@ static int ssd1362_init_device(const struct device *dev)
 		return ret;
 	}
 
-	/* Remap: 0xC3 = column remap + nibble remap + SEG split + SEG left/right */
 	data[0] = 0xC3;
 	ret = ssd1362_write_command(dev, SSD1362_SET_REMAP, data, 1);
 	if (ret < 0) {
@@ -327,7 +479,7 @@ static int ssd1362_init_device(const struct device *dev)
 		return ret;
 	}
 
-	data[0] = 0x9E;
+	data[0] = config->iref_external ? 0x8E : 0x9E;
 	ret = ssd1362_write_command(dev, SSD1362_SET_IREF, data, 1);
 	if (ret < 0) {
 		return ret;
@@ -386,15 +538,19 @@ static DEVICE_API(display, ssd1362_driver_api) = {
 	.write = ssd1362_write,
 	.set_contrast = ssd1362_set_contrast,
 	.get_capabilities = ssd1362_get_capabilities,
+	.set_pixel_format = ssd1362_set_pixel_format,
 };
 
 #define SSD1362_CONV_BUFFER_SIZE(node_id)                                                          \
 	DIV_ROUND_UP(DT_PROP(node_id, width) * DT_PROP(node_id, height) *                          \
 			     DT_PROP(node_id, segments_per_pixel),                                 \
-		     SEGMENTS_PER_BYTE)
+		     SSD1362_SEGMENTS_PER_BYTE)
 
 #define SSD1362_DEFINE(node_id)                                                                    \
 	static uint8_t conversion_buf##node_id[SSD1362_CONV_BUFFER_SIZE(node_id)];                 \
+	static struct ssd1362_data data##node_id = {                                               \
+		.current_pf = PIXEL_FORMAT_RGB_565,                                                \
+	};                                                                                         \
 	static const struct ssd1362_config config##node_id = {                                     \
 		.height = DT_PROP(node_id, height),                                                \
 		.width = DT_PROP(node_id, width),                                                  \
@@ -411,6 +567,7 @@ static DEVICE_API(display, ssd1362_driver_api) = {
 		.segments_per_pixel = DT_PROP(node_id, segments_per_pixel),                        \
 		.contrast = DT_PROP(node_id, contrast),                                            \
 		.inversion_on = DT_PROP(node_id, inversion_on),                                    \
+		.iref_external = DT_PROP(node_id, iref_external),                                  \
 		.mipi_dev = DEVICE_DT_GET(DT_PARENT(node_id)),                                     \
 		.dbi_config = {.mode = MIPI_DBI_MODE_SPI_4WIRE,                                    \
 			       .config = MIPI_DBI_SPI_CONFIG_DT(                                   \
@@ -419,7 +576,7 @@ static DEVICE_API(display, ssd1362_driver_api) = {
 		.conversion_buf_size = sizeof(conversion_buf##node_id),                            \
 	};                                                                                         \
                                                                                                    \
-	DEVICE_DT_DEFINE(node_id, ssd1362_init, NULL, NULL, &config##node_id, POST_KERNEL,         \
-			 CONFIG_DISPLAY_INIT_PRIORITY, &ssd1362_driver_api);
+	DEVICE_DT_DEFINE(node_id, ssd1362_init, NULL, &data##node_id, &config##node_id,            \
+			 POST_KERNEL, CONFIG_DISPLAY_INIT_PRIORITY, &ssd1362_driver_api);
 
 DT_FOREACH_STATUS_OKAY(solomon_ssd1362, SSD1362_DEFINE)

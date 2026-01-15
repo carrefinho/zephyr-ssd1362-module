@@ -1,8 +1,4 @@
-description: |
-  SSD1362 OLED display controller (256x64, 4-bit grayscale)
-
-  The SSD1362 is a single-chip CMOS OLED driver with controller for
-  256x64 dot matrix graphic display with 16 gray scale levels.
+description: Solomon SSD1362 256x64 16 gray level OLED display controller
 
 compatible: "solomon,ssd1362"
 
@@ -12,69 +8,46 @@ properties:
   column-offset:
     type: int
     default: 0
-    description: |
-      Column offset in display RAM. The SSD1362 has 128 column addresses
-      (0x00-0x7F) where each address maps to 2 pixels (4-bit per pixel).
-      For a centered 256-pixel display, the offset is typically 0.
+    description: First visible column number.
 
   row-offset:
     type: int
     default: 0
-    description: |
-      Display offset (vertical shift) from 0 to 63.
-      The default corresponds to the reset value of the register.
+    description: Display offset (vertical shift) from 0 to 63.
 
   start-line:
     type: int
     default: 0
-    description: |
-      Starting line address of display RAM (0-63).
-      The default corresponds to the reset value of the register.
+    description: Starting line address of display RAM (0-63).
 
   mux-ratio:
     type: int
     default: 64
-    description: |
-      Multiplex ratio from 16 to 64. This sets the number of COM
-      lines to be used (MUX ratio = value). For a 64-row display,
-      use 64. The default corresponds to a full 64-row display.
+    description: Multiplex ratio from 16 to 64. Typically height.
 
   remap-columns:
     type: boolean
-    description: |
-      Enable column address re-map. When enabled, SEG0 is mapped to
-      column 127 instead of column 0 (horizontal flip).
+    description: Reverse the column order (flip horizontally).
 
   remap-nibble:
     type: boolean
-    description: |
-      Enable nibble re-map. When enabled, the nibble order within
-      each byte is reversed.
+    description: Reverse nibble order within each byte.
 
   remap-row-first:
     type: boolean
-    description: |
-      Enable vertical address increment mode. When disabled (default),
-      addresses increment horizontally. When enabled, addresses
-      increment vertically.
+    description: Set scan direction to vertical first (swap rows/columns).
 
   remap-rows:
     type: boolean
-    description: |
-      Enable COM re-map. When enabled, scans from COM[N-1] to COM0
-      instead of COM0 to COM[N-1] (vertical flip).
+    description: Reverse the row order (flip vertically).
 
   remap-com-odd-even-split:
     type: boolean
-    description: |
-      Enable SEG split odd/even mode. This affects how COM pins are
-      mapped to display rows.
+    description: Odd even split of COM pins.
 
   remap-com-dual:
     type: boolean
-    description: |
-      Enable SEG left/right remap. This swaps the left and right
-      halves of the display.
+    description: SEG left/right remap.
 
   segments-per-pixel:
     type: int
@@ -86,17 +59,16 @@ properties:
       Map multiple adjacent segments to one pixel.
       Some displays connect two adjacent pixel drivers to each physical pixel.
       By setting this to 2, the driver will repeat each pixel.
-      The default disables this functionality.
 
   contrast:
     type: int
     default: 0x9F
-    description: |
-      Initial contrast setting (0-255). Higher values increase brightness
-      but also increase current draw. The default (0x9F) matches u8g2.
+    description: Initial contrast setting (0-255).
 
   inversion-on:
     type: boolean
-    description: |
-      Invert display colors. When enabled, pixels that would normally be
-      white are displayed as black and vice versa.
+    description: Invert display colors.
+
+  iref-external:
+    type: boolean
+    description: Use external IREF current reference instead of internal.
