@@ -1,0 +1,8 @@
+# Copyright (c) 2024 Lukasz Hawrylko
+# SPDX-License-Identifier: Apache-2.0
+
+if DISPLAY
+
+rsource "Kconfig.ssd1362"
+
+endif # DISPLAY
