@@ -20,8 +20,8 @@ Tested with ZJY312S0700WG11 display module and nRF54L15 DK.
     mipi_dbi_ssd1362 {
         compatible = "zephyr,mipi-dbi-spi";
         spi-dev = <&spi00>;
-        dc-gpios = <&gpio2 6 GPIO_ACTIVE_HIGH>;
-        reset-gpios = <&gpio2 8 GPIO_ACTIVE_LOW>;
+        dc-gpios = <&gpio2 6 GPIO_ACTIVE_HIGH>;      // <-- active high
+        reset-gpios = <&gpio2 8 GPIO_ACTIVE_LOW>;    // <-- active low
         write-only;
         #address-cells = <1>;
         #size-cells = <0>;
@@ -40,6 +40,14 @@ Tested with ZJY312S0700WG11 display module and nRF54L15 DK.
             iref-external;
         };
     };
+};
+
+&spi00 {
+	status = "okay";
+	cs-gpios = <&gpio2 5 GPIO_ACTIVE_LOW>;             // <-- active low
+	pinctrl-0 = <&spi00_default>;
+	pinctrl-1 = <&spi00_sleep>;
+	pinctrl-names = "default", "sleep";
 };
 ```
 
