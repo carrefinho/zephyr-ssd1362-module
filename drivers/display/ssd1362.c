@@ -114,16 +114,16 @@ static int ssd1362_conv_mono01_grayscale(const uint8_t **buf_in, uint32_t *pixel
 		uint8_t b = (*buf_in)[in_idx];
 
 		for (size_t s = 0; s < segments_per_pixel; s++) {
-			buf_out[out_idx++] = ((b & BIT(0)) ? 0xF0 : 0) | ((b & BIT(1)) ? 0x0F : 0);
+			buf_out[out_idx++] = ((b & BIT(0)) ? 0x00 : 0xF0) | ((b & BIT(1)) ? 0x00 : 0x0F);
 		}
 		for (size_t s = 0; s < segments_per_pixel; s++) {
-			buf_out[out_idx++] = ((b & BIT(2)) ? 0xF0 : 0) | ((b & BIT(3)) ? 0x0F : 0);
+			buf_out[out_idx++] = ((b & BIT(2)) ? 0x00 : 0xF0) | ((b & BIT(3)) ? 0x00 : 0x0F);
 		}
 		for (size_t s = 0; s < segments_per_pixel; s++) {
-			buf_out[out_idx++] = ((b & BIT(4)) ? 0xF0 : 0) | ((b & BIT(5)) ? 0x0F : 0);
+			buf_out[out_idx++] = ((b & BIT(4)) ? 0x00 : 0xF0) | ((b & BIT(5)) ? 0x00 : 0x0F);
 		}
 		for (size_t s = 0; s < segments_per_pixel; s++) {
-			buf_out[out_idx++] = ((b & BIT(6)) ? 0xF0 : 0) | ((b & BIT(7)) ? 0x0F : 0);
+			buf_out[out_idx++] = ((b & BIT(6)) ? 0x00 : 0xF0) | ((b & BIT(7)) ? 0x00 : 0x0F);
 		}
 
 		in_idx++;
@@ -292,7 +292,7 @@ static int ssd1362_write(const struct device *dev, const uint16_t x, const uint1
 		return -EINVAL;
 	}
 
-	pf = (data != NULL) ? data->current_pf : PIXEL_FORMAT_RGB_565;
+	pf = (data != NULL) ? data->current_pf : PIXEL_FORMAT_MONO01;
 
 	if (pf == PIXEL_FORMAT_RGB_565) {
 		const uint16_t *rgb_buf = (const uint16_t *)buf;
@@ -338,6 +338,11 @@ static int ssd1362_write(const struct device *dev, const uint16_t x, const uint1
 		return 0;
 	}
 
+	if (desc->pitch > desc->width) {
+		LOG_ERR("Unsupported mode");
+		return -EINVAL;
+	}
+
 	cmd_data[0] = y;
 	cmd_data[1] = y + desc->height - 1;
 	ret = ssd1362_write_command(dev, SSD1362_SET_ROW_ADDR, cmd_data, 2);
@@ -370,7 +375,7 @@ static void ssd1362_get_capabilities(const struct device *dev, struct display_ca
 	caps->x_resolution = config->width;
 	caps->y_resolution = config->height;
 	caps->supported_pixel_formats = PIXEL_FORMAT_MONO01 | PIXEL_FORMAT_RGB_565;
-	caps->current_pixel_format = (data != NULL) ? data->current_pf : PIXEL_FORMAT_RGB_565;
+	caps->current_pixel_format = (data != NULL) ? data->current_pf : PIXEL_FORMAT_MONO01;
 	caps->screen_info = 0;
 }
 
@@ -549,7 +554,7 @@ static DEVICE_API(display, ssd1362_driver_api) = {
 #define SSD1362_DEFINE(node_id)                                                                    \
 	static uint8_t conversion_buf##node_id[SSD1362_CONV_BUFFER_SIZE(node_id)];                 \
 	static struct ssd1362_data data##node_id = {                                               \
-		.current_pf = PIXEL_FORMAT_RGB_565,                                                \
+		.current_pf = PIXEL_FORMAT_MONO01,                                                 \
 	};                                                                                         \
 	static const struct ssd1362_config config##node_id = {                                     \
 		.height = DT_PROP(node_id, height),                                                \
