@@ -5,3 +5,12 @@ config SSD1362
 	select MIPI_DBI
 	help
 	  Enable driver for SSD1362 display controller.
+
+if SSD1362
+
+config SSD1362_DEFAULT_GREYSCALE
+	bool "SSD1362 default mode is greyscale"
+	help
+	  Sets greyscale mode as default mode.
+
+endif # SSD1362

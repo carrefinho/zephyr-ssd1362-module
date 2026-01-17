@@ -41,6 +41,12 @@ LOG_MODULE_REGISTER(ssd1362, CONFIG_DISPLAY_LOG_LEVEL);
 #define SSD1362_BITS_PER_SEGMENT       4
 #define SSD1362_SEGMENTS_PER_BYTE      (8 / SSD1362_BITS_PER_SEGMENT)
 
+#ifdef CONFIG_SSD1362_DEFAULT_GREYSCALE
+#define SSD1362_DEFAULT_PIXEL_FORMAT PIXEL_FORMAT_RGB_565
+#else
+#define SSD1362_DEFAULT_PIXEL_FORMAT PIXEL_FORMAT_MONO01
+#endif
+
 struct ssd1362_data {
 	enum display_pixel_format current_pf;
 };
@@ -292,7 +298,7 @@ static int ssd1362_write(const struct device *dev, const uint16_t x, const uint1
 		return -EINVAL;
 	}
 
-	pf = (data != NULL) ? data->current_pf : PIXEL_FORMAT_MONO01;
+	pf = (data != NULL) ? data->current_pf : SSD1362_DEFAULT_PIXEL_FORMAT;
 
 	if (pf == PIXEL_FORMAT_RGB_565) {
 		const uint16_t *rgb_buf = (const uint16_t *)buf;
@@ -375,7 +381,7 @@ static void ssd1362_get_capabilities(const struct device *dev, struct display_ca
 	caps->x_resolution = config->width;
 	caps->y_resolution = config->height;
 	caps->supported_pixel_formats = PIXEL_FORMAT_MONO01 | PIXEL_FORMAT_RGB_565;
-	caps->current_pixel_format = (data != NULL) ? data->current_pf : PIXEL_FORMAT_MONO01;
+	caps->current_pixel_format = (data != NULL) ? data->current_pf : SSD1362_DEFAULT_PIXEL_FORMAT;
 	caps->screen_info = 0;
 }
 
@@ -554,7 +560,7 @@ static DEVICE_API(display, ssd1362_driver_api) = {
 #define SSD1362_DEFINE(node_id)                                                                    \
 	static uint8_t conversion_buf##node_id[SSD1362_CONV_BUFFER_SIZE(node_id)];                 \
 	static struct ssd1362_data data##node_id = {                                               \
-		.current_pf = PIXEL_FORMAT_MONO01,                                                 \
+		.current_pf = SSD1362_DEFAULT_PIXEL_FORMAT,                                        \
 	};                                                                                         \
 	static const struct ssd1362_config config##node_id = {                                     \
 		.height = DT_PROP(node_id, height),                                                \
